@@ -4,13 +4,13 @@ use bettapay_common::{constants::BPS_DENOMINATOR, events};
 
 use crate::errors::SettlementError;
 use crate::storage::{
-    assert_not_paused, is_merchant_registered_and_bump_ttl, is_merchant_registered_internal,
-    read_rule_or_default,
+    assert_not_paused, assert_payments_readable, is_merchant_registered_and_bump_ttl,
+    is_merchant_registered_internal, read_min_payment_amount, read_rule_or_default,
 };
 use crate::types::{DataKey, FeeSplit, PaymentRecord, SettlementRule};
 use crate::{
-    SettlementContract, SettlementContractClient, MAX_PAYMENTS_BATCH, MIN_PAYMENT_AMOUNT,
-    PAYMENT_TTL_BUMP, PAYMENT_TTL_THRESHOLD,
+    SettlementContract, SettlementContractClient, MAX_PAYMENTS_BATCH, PAYMENT_TTL_BUMP,
+    PAYMENT_TTL_THRESHOLD,
 };
 
 /// Computes the platform, network, and merchant fee amounts for an amount using ceil-based rounding.
@@ -46,14 +46,16 @@ fn calculate_split(env: &Env, amount: i128, rule: &SettlementRule) -> FeeSplit {
     // To prevent fee under-collection, ceiling division is simulated by adding `BPS_DENOMINATOR - 1` to the numerator.
     // Edge case: For small amounts, ceil rounding can force fees to 1 unit even when the basis points represent a tiny fraction.
     let platform_fee_amount = platform_bps.calculate_fee_ceil(amount);
-    let network_fee_amount = network_bps.calculate_fee_ceil(amount);
+    let mut network_fee_amount = network_bps.calculate_fee_ceil(amount);
 
-    // The merchant amount is calculated as the subtraction remainder of the gross amount minus all rounded-up fees.
-    // This ensures the sum of the split amounts (platform fee + network fee + merchant share) always equals the gross amount,
-    // except when the remainder is negative. For very small gross amounts with high/extreme fee percentages,
-    // the sum of rounded-up fees can exceed the gross amount. We explicitly clamp the merchant amount to 0 in this case.
-    let remainder = amount - platform_fee_amount - network_fee_amount;
-    let merchant_amount = remainder.max(0);
+    // Ceil-rounded fees can sum to more than the gross for tiny amounts with
+    // high fee configs. Clamp the network leg so total fees never exceed the
+    // gross, keeping the accounting equation balanced (issue #683).
+    if platform_fee_amount + network_fee_amount > amount {
+        network_fee_amount = amount - platform_fee_amount;
+    }
+
+    let merchant_amount = (amount - platform_fee_amount - network_fee_amount).max(0);
     FeeSplit {
         gross_amount: amount,
         platform_fee_amount,
@@ -65,7 +67,7 @@ fn calculate_split(env: &Env, amount: i128, rule: &SettlementRule) -> FeeSplit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::{proptest, prop_assert, prop_assert_eq};
+    use proptest::{prop_assert, prop_assert_eq, proptest};
 
     #[test]
     fn zero_fee_split_handles_maximum_amount() {
@@ -91,6 +93,59 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn split_matches_ceil_arithmetic_and_never_negative_merchant(
+            amount in 1i128..=1_000_000_000,
+            platform_fee_bps in 0u32..=10_000,
+            network_fee_bps in 0u32..=10_000,
+        ) {
+            let env = Env::default();
+            let rule = SettlementRule {
+                platform_fee_bps,
+                network_fee_bps,
+                settlement_delay_ledger: 0,
+                auto_settle: false,
+            };
+
+            let split = calculate_split(&env, amount, &rule);
+            let denom = BPS_DENOMINATOR as i128;
+            let expected_platform =
+                (amount * platform_fee_bps as i128 + denom - 1) / denom;
+            let expected_network =
+                (amount * network_fee_bps as i128 + denom - 1) / denom;
+            let expected_merchant =
+                (amount - expected_platform - expected_network).max(0);
+
+            prop_assert_eq!(split.gross_amount, amount);
+            prop_assert_eq!(split.platform_fee_amount, expected_platform);
+            prop_assert_eq!(split.network_fee_amount, expected_network);
+            prop_assert_eq!(split.merchant_amount, expected_merchant);
+            prop_assert!(split.merchant_amount >= 0);
+        }
+
+        #[test]
+        fn zero_fee_legs_preserve_the_gross_amount(
+            amount in 1i128..=i128::MAX,
+        ) {
+            let env = Env::default();
+            let rule = SettlementRule {
+                platform_fee_bps: 0,
+                network_fee_bps: 0,
+                settlement_delay_ledger: 0,
+                auto_settle: false,
+            };
+
+            let split = calculate_split(&env, amount, &rule);
+
+            prop_assert_eq!(split.platform_fee_amount, 0);
+            prop_assert_eq!(split.network_fee_amount, 0);
+            prop_assert_eq!(split.merchant_amount, amount);
+            prop_assert_eq!(
+                split.platform_fee_amount + split.network_fee_amount + split.merchant_amount,
+                amount,
+            );
+        }
+
         #[test]
         fn extreme_fees_clamp_merchant_amount_to_zero(
             amount in 1i128..=10,
@@ -122,7 +177,7 @@ impl SettlementContract {
     /// * [`MerchantMissing`](SettlementError::MerchantMissing) — if the merchant is not registered.
     /// * [`InvalidPaymentReference`](SettlementError::InvalidPaymentReference) — if `reference` is all zeros.
     /// * [`AmountTooSmall`](SettlementError::AmountTooSmall) — if `amount` is below the minimum.
-    /// * [`DuplicatePaymentReference`](SettlementError::DuplicatePaymentReference) — if the reference already exists.
+    /// * [`DuplicatePaymentReference`](SettlementError::DuplicatePaymentReference) — if the reference already exists for this merchant.
     /// * [`AmountOverflow`](SettlementError::AmountOverflow) — if `amount * bps` would overflow `i128`.
     ///
     /// ## Emitted Event: `payment_stored`
@@ -153,21 +208,27 @@ impl SettlementContract {
         if reference == BytesN::from_array(&env, &[0; 32]) {
             panic_with_error!(&env, SettlementError::InvalidPaymentReference);
         }
-        if amount < MIN_PAYMENT_AMOUNT {
+        let min_amount = read_min_payment_amount(&env);
+        if amount < min_amount {
             panic_with_error!(&env, SettlementError::AmountTooSmall);
         }
 
-        let payment_key = DataKey::Payment(reference.clone());
+        // Reference uniqueness is scoped to the merchant: the same reference
+        // may be used by two different merchants, so the key carries the
+        // merchant alongside the reference (issue #493). A duplicate is only
+        // a duplicate for the same merchant.
+        let payment_key = DataKey::Payment(merchant.clone(), reference.clone());
         if env.storage().persistent().has(&payment_key) {
             panic_with_error!(&env, SettlementError::DuplicatePaymentReference);
         }
 
         // ISSUE 495: Reentrancy guard.
-        // We write a dummy record to storage immediately so that if the external 
-        // read_governance_fee_rule call results in a reentrant call back to this 
-        // contract, the `has` check above will catch it. This dummy record is 
+        // We write a dummy record to storage immediately so that if the external
+        // read_governance_fee_rule call results in a reentrant call back to this
+        // contract, the `has` check above will catch it. This dummy record is
         // overwritten by the actual record at the end of this function.
         let dummy_record = PaymentRecord {
+            merchant: merchant.clone(),
             amount: 0,
             platform_fee_amount: 0,
             network_fee_amount: 0,
@@ -183,6 +244,7 @@ impl SettlementContract {
         let rule = read_rule_or_default(&env, merchant.clone());
         let split = calculate_split(&env, amount, &rule);
         let record = PaymentRecord {
+            merchant: merchant.clone(),
             amount,
             platform_fee_amount: split.platform_fee_amount,
             network_fee_amount: split.network_fee_amount,
@@ -207,7 +269,7 @@ impl SettlementContract {
                 merchant.clone(),
                 reference.clone(),
             ),
-            (),
+            record,
         );
 
         split
@@ -224,16 +286,38 @@ impl SettlementContract {
         if !is_merchant_registered_internal(&env, merchant.clone()) {
             panic_with_error!(&env, SettlementError::MerchantMissing);
         }
-        if amount < MIN_PAYMENT_AMOUNT {
+        let min_amount = read_min_payment_amount(&env);
+        if amount < min_amount {
             panic_with_error!(env, SettlementError::AmountTooSmall);
         }
         let rule = read_rule_or_default(&env, merchant);
         calculate_split(&env, amount, &rule)
     }
 
-    /// Retrieve a payment record by its reference, extending the storage TTL if found.
-    pub fn get_payment_reference(env: Env, reference: BytesN<32>) -> Option<PaymentRecord> {
-        let key = DataKey::Payment(reference);
+    /// Retrieve a payment record for a merchant by its reference, extending
+    /// the storage TTL if found.
+    ///
+    /// The reference is resolved within the merchant's own namespace, so the
+    /// same reference held by a different merchant is not returned.
+    /// This read is public: the 32-byte payment reference is the lookup
+    /// capability used by indexers and composing contracts.
+    ///
+    /// # Panics
+    ///
+    /// * Auth failure — if the caller is not the merchant who owns the
+    ///   record. Reads are gated behind the merchant's own authorization so
+    ///   the gross/fee/net amounts cannot be probed by anyone who can guess
+    ///   a reference (issue #492).
+    /// * [`PaymentOrphaned`](SettlementError::PaymentOrphaned) — if the
+    ///   merchant was unregistered, its payment records are orphaned and no
+    ///   longer readable (issue #490).
+    pub fn get_payment_reference(
+        env: Env,
+        merchant: Address,
+        reference: BytesN<32>,
+    ) -> Option<PaymentRecord> {
+        assert_payments_readable(&env, &merchant);
+        let key = DataKey::Payment(merchant, reference);
         let record: Option<PaymentRecord> = env.storage().persistent().get(&key);
         if record.is_some() {
             // `extend_ttl` only writes when the current TTL is below
@@ -247,17 +331,31 @@ impl SettlementContract {
         record
     }
 
-    /// Retrieve multiple payment records by a vector of references.
+    /// Retrieve multiple payment records for a merchant by a vector of references.
     ///
-    /// The returned vector contains only records that exist.
-    pub fn get_payments(env: Env, refs: Vec<BytesN<32>>) -> Vec<PaymentRecord> {
+    /// References are resolved within the merchant's own namespace and the
+    /// returned vector contains only records that exist.
+    /// This read is public so indexers and composing contracts can verify
+    /// known payment references without a merchant signature.
+    ///
+    /// # Panics
+    ///
+    /// * Auth failure — if the caller is not the merchant who owns the
+    ///   records (issue #492).
+    /// * [`PaymentOrphaned`](SettlementError::PaymentOrphaned) — if the
+    ///   merchant was unregistered, its payment records are orphaned and no
+    ///   longer readable (issue #490).
+    /// * [`BatchTooLarge`](SettlementError::BatchTooLarge) — if `refs` exceeds
+    ///   [`MAX_PAYMENTS_BATCH`].
+    pub fn get_payments(env: Env, merchant: Address, refs: Vec<BytesN<32>>) -> Vec<PaymentRecord> {
+        assert_payments_readable(&env, &merchant);
         if refs.len() > MAX_PAYMENTS_BATCH {
             panic_with_error!(env, SettlementError::BatchTooLarge);
         }
-        
+
         let mut payments = Vec::new(&env);
         for reference in refs.iter() {
-            let key = DataKey::Payment(reference);
+            let key = DataKey::Payment(merchant.clone(), reference);
             if let Some(payment) = env.storage().persistent().get::<_, PaymentRecord>(&key) {
                 payments.push_back(payment);
             }

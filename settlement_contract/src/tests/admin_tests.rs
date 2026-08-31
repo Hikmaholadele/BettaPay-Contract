@@ -28,7 +28,9 @@ fn emits_event_on_initialization() {
     let contract_id = env.register_contract(None, SettlementContract);
     let client = SettlementContractClient::new(&env, &contract_id);
 
+    let deployer = Address::generate(&env);
     client.init(
+        &deployer,
         &soroban_sdk::vec![&env, admin.clone()],
         &1,
         &governance,
@@ -46,7 +48,8 @@ fn rejects_double_initialization() {
     let (env, client, admins, _) = setup();
     let governance = register_governance(&env);
     let recovery_address = Address::generate(&env);
-    client.init(&admins, &1, &governance, &recovery_address);
+    let deployer = Address::generate(&env);
+    client.init(&deployer, &admins, &1, &governance, &recovery_address);
     let _ = env;
 }
 
@@ -95,14 +98,10 @@ fn every_admin_writer_preserves_the_vector_shape() {
     let scheduled_admin = Address::generate(&env);
     let scheduled_admins = soroban_sdk::vec![&env, scheduled_admin.clone()];
     let operation = Operation::TransferAdmin(scheduled_admins, 1);
-    client.schedule(
-        &admins.get(0).unwrap(),
-        &operation,
-        &DEFAULT_TIMELOCK_DELAY_SECONDS,
-    );
+    client.schedule(&admins, &operation, &DEFAULT_TIMELOCK_DELAY_SECONDS);
     env.ledger()
         .with_mut(|ledger| ledger.timestamp += DEFAULT_TIMELOCK_DELAY_SECONDS);
-    client.execute(&operation);
+    client.execute(&admins.get(0).unwrap(), &operation);
     assert_eq!(client.get_admin(), soroban_sdk::vec![&env, scheduled_admin]);
 }
 
@@ -246,6 +245,54 @@ fn pause_rejected_for_non_admin() {
     client.pause(&soroban_sdk::vec![&env, non_admin]);
 }
 
+// ---------------------------------------------------------------------------
+// Pause idempotency (mirrors governance — both contracts must behave the same)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_rejected_when_already_paused() {
+    let (_env, client, admins, _merchant) = setup();
+    client.pause(&admins);
+    // Second pause must reject with AlreadyPaused (#15) and emit no extra event.
+    client.pause(&admins);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn unpause_rejected_when_already_unpaused() {
+    let (_env, client, admins, _merchant) = setup();
+    // Contract starts unpaused; calling unpause immediately must reject with AlreadyUnpaused (#16).
+    client.unpause(&admins);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn double_pause_emits_no_extra_event() {
+    let (env, client, admins, _merchant) = setup();
+    client.pause(&admins);
+    let prev = env.events().all().len();
+    client.pause(&admins);
+    assert_eq!(
+        env.events().all().len(),
+        prev,
+        "double pause must not emit events"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn unpause_when_not_paused_emits_no_event() {
+    let (env, client, admins, _merchant) = setup();
+    let prev = env.events().all().len();
+    client.unpause(&admins);
+    assert_eq!(
+        env.events().all().len(),
+        prev,
+        "unpause when not paused must not emit events"
+    );
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn merchant_registration_blocked_when_paused() {
@@ -311,10 +358,13 @@ fn register_merchant_rejects_admin_address() {
 #[should_panic(expected = "Error(Contract, #5)")]
 fn set_default_rule_rejected_when_paused() {
     let (_env, client, admins, _merchant) = setup();
-    
+
     // Pause the contract to simulate an emergency state
     client.pause(&admins);
-    assert_eq!(client.is_paused(), true, "Contract must be paused before testing rejection");
+    assert!(
+        client.is_paused(),
+        "Contract must be paused before testing rejection"
+    );
 
     // Attempt to set a valid default rule; this should be rejected due to the pause state
     let rule = SettlementRule {
@@ -420,7 +470,10 @@ fn executes_contract_wasm_upgrade_successfully() {
 
     // Empty wasm has no `supports_interface` — upgrade must fail.
     let result = client.try_upgrade(&admins, &bad_hash);
-    assert!(result.is_err(), "upgrade with non-conforming wasm must be rejected");
+    assert!(
+        result.is_err(),
+        "upgrade with non-conforming wasm must be rejected"
+    );
 
     // Contract remains operational after the rejected upgrade.
     let live_client = SettlementContractClient::new(&env, &client.address);
@@ -445,7 +498,8 @@ fn change_threshold_above_admin_count_rejects_with_invalid_threshold() {
     let governance = register_governance(&env);
     let contract_id = env.register_contract(None, SettlementContract);
     let client = SettlementContractClient::new(&env, &contract_id);
-    client.init(&admins, &1, &governance, &recovery);
+    let deployer = Address::generate(&env);
+    client.init(&deployer, &admins, &1, &governance, &recovery);
 
     // Threshold 3 > admins.len() 2 — must fail with InvalidThreshold, not auth.
     client.change_threshold(&admins, &3);
@@ -464,7 +518,8 @@ fn change_threshold_zero_rejects_with_invalid_threshold() {
     let governance = register_governance(&env);
     let contract_id = env.register_contract(None, SettlementContract);
     let client = SettlementContractClient::new(&env, &contract_id);
-    client.init(&admins, &2, &governance, &recovery);
+    let deployer = Address::generate(&env);
+    client.init(&deployer, &admins, &2, &governance, &recovery);
 
     client.change_threshold(&admins, &0);
 }
@@ -484,7 +539,9 @@ fn recovery_executes_after_delay() {
     let contract_id = env.register_contract(None, SettlementContract);
     let client = SettlementContractClient::new(&env, &contract_id);
 
+    let deployer = Address::generate(&env);
     client.init(
+        &deployer,
         &soroban_sdk::vec![&env, admin.clone()],
         &1,
         &governance,

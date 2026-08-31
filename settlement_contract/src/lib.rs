@@ -33,17 +33,17 @@
 //!
 //! ## Settlement Boundary (Off-Chain Execution)
 //!
-//! This contract calculates and securely locks the fee split for each payment in a `PaymentRecord` and emits a 
+//! This contract calculates and securely locks the fee split for each payment in a `PaymentRecord` and emits a
 //! `payment_stored` event. It does **not** transfer tokens, hold funds, or expose an in-contract `settle` function.
 //!
 //! Settlement execution is intentionally designed to be **off-chain**:
 //! 1. **Indexers** listen to `payment_stored` events and read the `PaymentRecord` state.
-//! 2. **Readiness** is verified off-chain by evaluating if the current ledger sequence satisfies the delay: 
+//! 2. **Readiness** is verified off-chain by evaluating if the current ledger sequence satisfies the delay:
 //!    `current_ledger >= record.ledger + record.settlement_delay_ledger`.
-//! 3. **Execution** happens via a separate off-chain payout engine that processes transfers (batching where 
+//! 3. **Execution** happens via a separate off-chain payout engine that processes transfers (batching where
 //!    appropriate based on `auto_settle` preferences) and tracks settlement state externally.
 //!
-//! The in-contract flags (`settlement_delay_ledger`, `auto_settle`) are strictly informational directives 
+//! The in-contract flags (`settlement_delay_ledger`, `auto_settle`) are strictly informational directives
 //! enforcing standardized agreement parameters for off-chain consumers; they do not trigger on-chain state transitions.
 //!
 //! ## Event Conventions
@@ -97,10 +97,11 @@
 //!    struct — the old type is what keeps those entries readable.
 //! 4. Order is: upgrade the Wasm, then call `migrate`, then verify the
 //!    post-upgrade state, then remove the migration code in a later upgrade.
-//! 5. `Payment(BytesN<32>)`, `Merchant(Address)` and `Rule(Address)` are keyed
-//!    by value and Soroban cannot enumerate storage keys — which is why
-//!    [`SettlementContract::get_payments`] takes the references from the
-//!    caller. Convert these lazily on read, or pass the keys in explicitly.
+//! 5. `Payment(Address, BytesN<32>)`, `Merchant(Address)` and `Rule(Address)`
+//!    are keyed by value and Soroban cannot enumerate storage keys — which is
+//!    why [`SettlementContract::get_payments`] takes the merchant and the
+//!    references from the caller. Convert these lazily on read, or pass the
+//!    keys in explicitly.
 //! 6. Call `extend_ttl` on anything the migration rewrites: `set` alone does
 //!    not extend an entry's life, so a migrated record would otherwise expire
 //!    sooner than an untouched one.
@@ -183,7 +184,9 @@ use bettapay_common::constants::MIN_FEE_BPS;
 use soroban_sdk::contract;
 
 pub use errors::SettlementError;
-pub use types::{Bps, FeeSplit, GovFeeConfig, Operation, PaymentRecord, SettlementRule};
+pub use types::{
+    Bps, FeeSplit, GovFeeConfig, Operation, PaymentRecord, ScheduledOp, SettlementRule,
+};
 
 /// Minimum gross payment amount, in the asset's smallest unit.
 ///
@@ -222,6 +225,15 @@ pub(crate) const MERCHANT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 14;
 pub(crate) const MERCHANT_TTL_BUMP: u32 = LEDGERS_PER_DAY * 30;
 
 pub(crate) const DEFAULT_TIMELOCK_DELAY_SECONDS: u64 = 2 * 24 * 60 * 60; // 48 hours
+
+/// The single interface version advertised by `supports_interface`.
+///
+/// `upgrade` probes the incoming Wasm with `supports_interface(SUPPORTED_INTERFACE_VERSION)`
+/// before committing the swap. Any Wasm that returns `false` (or traps) is
+/// rejected with `InvalidWasmInterface`. Increment this constant in a future
+/// Wasm update when a breaking API change requires callers to distinguish the
+/// new contract from this one (issue #48).
+pub(crate) const SUPPORTED_INTERFACE_VERSION: u32 = 1;
 
 // Settlement-specific TTL policy for short-lived reads of admin / governance /
 // recovery addresses. Deliberately shorter than the protocol defaults so that

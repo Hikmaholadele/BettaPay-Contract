@@ -14,7 +14,8 @@
 
 use crate::*;
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
-use soroban_sdk::{Address, BytesN, Env, FromVal, Symbol};
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{Address, BytesN, Env, FromVal, Symbol, TryFromVal, Val};
 
 use bettapay_common::events;
 
@@ -24,6 +25,91 @@ use super::{register_governance, setup};
 fn last_topic(env: &Env) -> Symbol {
     let (_, topics, _) = env.events().all().last().unwrap();
     Symbol::from_val(env, &topics.get(0).unwrap())
+}
+
+/// Returns the data payload of the most recent `settlement_rule_cleared`
+/// event emitted so far.
+fn last_settlement_rule_cleared_data(env: &Env) -> Val {
+    let events = env.events().all();
+    let mut found = None;
+    for i in 0..events.len() {
+        let (_contract, topics, data) = events.get(i).unwrap();
+        if !topics.is_empty()
+            && Symbol::from_val(env, &topics.get(0).unwrap())
+                == Symbol::new(env, events::SETTLEMENT_RULE_CLEARED_EVENT)
+        {
+            found = Some(data);
+        }
+    }
+    found.expect("settlement_rule_cleared event must have been emitted")
+}
+
+/// Issue #491: `clear_settlement_rule` used to emit `(admin, removed, fallback)`
+/// while the unregister path emitted `(admin, old_rule)` under the same
+/// `settlement_rule_cleared` topic — two arities for one event name, which
+/// breaks indexers. Both paths now publish through the shared
+/// `bettapay_common::events::emit_settlement_rule_cleared` helper, so the two
+/// events must carry the same topic and serialize byte-identically.
+#[test]
+fn settlement_rule_cleared_data_is_identical_across_both_paths() {
+    let (env, client, admins, merchant) = setup();
+    client.register_merchant(&admins, &merchant);
+
+    let rule = SettlementRule {
+        platform_fee_bps: 250,
+        network_fee_bps: 50,
+        settlement_delay_ledger: 0,
+        auto_settle: false,
+    };
+    let default_rule = SettlementRule {
+        platform_fee_bps: 150,
+        network_fee_bps: 30,
+        settlement_delay_ledger: 0,
+        auto_settle: false,
+    };
+    client.set_settlement_rule(&admins, &merchant, &rule);
+    client.set_default_rule(&admins, &default_rule);
+
+    // Path 1: explicit clear_settlement_rule.
+    client.clear_settlement_rule(&admins, &merchant);
+    let data_clear = last_settlement_rule_cleared_data(&env);
+
+    // Path 2: unregister_merchant removing a merchant that still has a rule.
+    client.set_settlement_rule(&admins, &merchant, &rule);
+    client.unregister_merchant(&admins, &merchant);
+    let data_unregister = last_settlement_rule_cleared_data(&env);
+
+    // Same topic on both paths.
+    let events = env.events().all();
+    let mut cleared_topics = 0;
+    for i in 0..events.len() {
+        let (_contract, topics, _data) = events.get(i).unwrap();
+        if !topics.is_empty()
+            && Symbol::from_val(&env, &topics.get(0).unwrap())
+                == Symbol::new(&env, events::SETTLEMENT_RULE_CLEARED_EVENT)
+        {
+            cleared_topics += 1;
+        }
+    }
+    assert_eq!(cleared_topics, 2, "both paths must emit the same topic");
+
+    // Byte-identical serialization — the acceptance criterion for #491.
+    assert_eq!(
+        data_clear.to_xdr(&env),
+        data_unregister.to_xdr(&env),
+        "both removal paths must serialize the settlement_rule_cleared \
+         payload identically",
+    );
+
+    // The payload still decodes as the canonical (admin, removed, fallback)
+    // triple, with the expected values.
+    let (admin, removed, fallback): (Address, SettlementRule, SettlementRule) =
+        TryFromVal::try_from_val(&env, &data_clear).unwrap();
+    assert_eq!(admin, admins.get(0).unwrap());
+    assert_eq!(removed.platform_fee_bps, 250);
+    assert_eq!(removed.network_fee_bps, 50);
+    assert_eq!(fallback.platform_fee_bps, 150);
+    assert_eq!(fallback.network_fee_bps, 30);
 }
 
 #[test]
@@ -40,7 +126,8 @@ fn threshold_changed_uses_canonical_topic() {
     let governance = register_governance(&env);
     let contract_id = env.register_contract(None, SettlementContract);
     let client = SettlementContractClient::new(&env, &contract_id);
-    client.init(&admins, &1, &governance, &recovery);
+    let deployer = Address::generate(&env);
+    client.init(&deployer, &admins, &1, &governance, &recovery);
 
     client.change_threshold(&admins, &2);
     assert_eq!(
@@ -64,7 +151,11 @@ fn upgrade_uses_canonical_topic() {
     let result = client.try_upgrade(&admins, &bad_hash);
     assert!(result.is_err(), "non-conforming wasm must be rejected");
     // No event emitted on failure.
-    assert_eq!(env.events().all().len(), before, "no event on failed upgrade");
+    assert_eq!(
+        env.events().all().len(),
+        before,
+        "no event on failed upgrade"
+    );
 }
 
 #[test]
@@ -145,10 +236,9 @@ fn default_rule_and_payment_use_canonical_topics() {
 #[test]
 fn scheduled_operation_lifecycle_uses_canonical_topics() {
     let (env, client, admins, merchant) = setup();
-    let admin = admins.get(0).unwrap();
     let operation = Operation::RegisterMerchant(merchant);
 
-    client.schedule(&admin, &operation, &DEFAULT_TIMELOCK_DELAY_SECONDS);
+    client.schedule(&admins, &operation, &DEFAULT_TIMELOCK_DELAY_SECONDS);
     assert_eq!(
         last_topic(&env),
         Symbol::new(&env, events::OP_SCHEDULED_EVENT)
@@ -156,19 +246,44 @@ fn scheduled_operation_lifecycle_uses_canonical_topics() {
 
     env.ledger()
         .with_mut(|ledger| ledger.timestamp += DEFAULT_TIMELOCK_DELAY_SECONDS);
-    client.execute(&operation);
+    client.execute(&admins.get(0).unwrap(), &operation);
     assert_eq!(
         last_topic(&env),
         Symbol::new(&env, events::OP_EXECUTED_EVENT)
     );
 
     let other_operation = Operation::UnregisterMerchant(Address::generate(&env));
-    client.schedule(&admin, &other_operation, &DEFAULT_TIMELOCK_DELAY_SECONDS);
-    client.cancel(&admin, &other_operation);
+    client.schedule(&admins, &other_operation, &DEFAULT_TIMELOCK_DELAY_SECONDS);
+    client.cancel(&admins, &other_operation);
     assert_eq!(
         last_topic(&env),
         Symbol::new(&env, events::OP_CANCELLED_EVENT)
     );
+}
+
+#[test]
+fn scheduled_operation_events_identify_the_executor() {
+    let (env, client, admins, merchant) = setup();
+    let executor = Address::generate(&env);
+    let operation = Operation::RegisterMerchant(merchant);
+
+    client.schedule(&admins, &operation, &DEFAULT_TIMELOCK_DELAY_SECONDS);
+    env.ledger()
+        .with_mut(|ledger| ledger.timestamp += DEFAULT_TIMELOCK_DELAY_SECONDS);
+    client.execute(&executor, &operation);
+
+    let events = env.events().all();
+    let mut actor = None;
+    for i in 0..events.len() {
+        let (_contract, topics, data) = events.get(i).unwrap();
+        if Symbol::from_val(&env, &topics.get(0).unwrap())
+            == Symbol::new(&env, events::MERCHANT_REGISTERED_EVENT)
+        {
+            actor = Some(Address::from_val(&env, &data));
+        }
+    }
+
+    assert_eq!(actor, Some(executor));
 }
 
 #[test]

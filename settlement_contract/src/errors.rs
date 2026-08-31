@@ -39,6 +39,10 @@ pub enum SettlementError {
     InvalidWasmInterface = 13,
     /// The provided multisig threshold is invalid.
     InvalidThreshold = 14,
+    /// `pause` was called while the contract was already paused.
+    AlreadyPaused = 15,
+    /// `unpause` was called while the contract was already unpaused.
+    AlreadyUnpaused = 16,
     /// `register_merchant` was called for an address that is already registered.
     MerchantExists = 300,
     /// The target merchant address is not registered. Raised by
@@ -71,6 +75,17 @@ pub enum SettlementError {
     FeeExceedsGovernanceConfig = 312,
     AmountTooSmall = 313,
     BatchTooLarge = 314,
+    /// The merchant's payment records are orphaned: the merchant was
+    /// unregistered (or never registered), so its payment history is no
+    /// longer readable even if the merchant is later re-registered.
+    /// Raised by `get_payment_reference` and `get_payments`.
+    PaymentOrphaned = 315,
+    /// `schedule()` computed a `sha256(operation)` key that already holds a
+    /// *different* pending operation's data — an actual hash collision
+    /// rather than a duplicate schedule of the same operation. Also raised
+    /// by `execute()`/`cancel()` if the operation supplied does not
+    /// byte-for-byte match the operation stored under that hash.
+    OperationHashCollision = 316,
 }
 
 const _: () = {
@@ -93,6 +108,8 @@ const _: () = {
     );
     assert!(SettlementError::InvalidWasmInterface as u32 == error_codes::INVALID_WASM_INTERFACE);
     assert!(SettlementError::InvalidThreshold as u32 == error_codes::INVALID_THRESHOLD);
+    assert!(SettlementError::AlreadyPaused as u32 == error_codes::ALREADY_PAUSED);
+    assert!(SettlementError::AlreadyUnpaused as u32 == error_codes::ALREADY_UNPAUSED);
     assert!(SettlementError::MerchantExists as u32 >= error_codes::SETTLEMENT_RANGE_START);
     assert!(SettlementError::MerchantMissing as u32 >= error_codes::SETTLEMENT_RANGE_START);
     assert!(
@@ -111,4 +128,6 @@ const _: () = {
     );
     assert!(SettlementError::AmountTooSmall as u32 >= error_codes::SETTLEMENT_RANGE_START);
     assert!(SettlementError::BatchTooLarge as u32 >= error_codes::SETTLEMENT_RANGE_START);
+    assert!(SettlementError::PaymentOrphaned as u32 >= error_codes::SETTLEMENT_RANGE_START);
+    assert!(SettlementError::OperationHashCollision as u32 >= error_codes::SETTLEMENT_RANGE_START);
 };
